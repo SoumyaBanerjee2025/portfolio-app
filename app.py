@@ -217,8 +217,15 @@ def upsert_projection_df(df: pd.DataFrame):
 # Live page helpers
 # -----------------------
 def fetch_live_fx(target_codes: List[str]) -> Dict[str, float]:
-    """Return currency->CHF rate for each target code. Base CHF assumed."""
+    """
+    Return conversion rate for 1 unit of <code> -> CHF.
+
+    exchangerate.host with base=CHF returns: 1 CHF -> X <code>.
+    To convert <code> -> CHF we need the inverse: 1 / X.
+    """
+    target_codes = [c.upper() for c in target_codes]
     rates = {"CHF": 1.0}
+
     fx_url = st.secrets["api"].get("fx_url", "https://api.exchangerate.host/latest?base=CHF")
     try:
         resp = requests.get(fx_url, timeout=10)
@@ -226,14 +233,16 @@ def fetch_live_fx(target_codes: List[str]) -> Dict[str, float]:
         data = resp.json()
         raw = data.get("rates", {})
         for code in target_codes:
-            code = code.upper()
             if code == "CHF":
                 rates[code] = 1.0
-            elif code in raw:
-                rates[code] = float(raw[code])  # CHF base → direct code->CHF
+            elif code in raw and raw[code]:
+                chf_to_code = float(raw[code])  # 1 CHF -> X code
+                if chf_to_code > 0:
+                    rates[code] = 1.0 / chf_to_code  # 1 code -> CHF
         return rates
     except Exception:
         return rates
+
 
 
 def fetch_btc_chf() -> Optional[float]:
