@@ -205,26 +205,39 @@ def upsert_projection_df(df: pd.DataFrame):
 # -----------------------
 def fetch_live_fx(target_codes: List[str]) -> Dict[str, float]:
     """
-    Return conversion rate for 1 unit of <code> -> CHF, using exchangerate.host/convert.
-    Example: convert?from=GBP&to=CHF returns 1 GBP in CHF.
+    Return 1 <code> -> CHF. Try Frankfurter (ECB) first, fall back to exchangerate.host.
     """
     rates = {"CHF": 1.0}
-    for code in {c.upper() for c in target_codes}:
-        if code in ("CHF", "BTC"):
-            continue
+    codes = {c.upper() for c in target_codes if c} - {"CHF", "BTC"}
+    for code in codes:
+        # 1) Frankfurter (ECB)
+        try:
+            r = requests.get(
+                f"https://api.frankfurter.app/latest?amount=1&from={code}&to=CHF",
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json().get("rates", {})
+            if "CHF" in data:
+                rates[code] = float(data["CHF"])
+                continue
+        except Exception:
+            pass
+        # 2) exchangerate.host fallback
         try:
             r = requests.get(
                 f"https://api.exchangerate.host/convert?from={code}&to=CHF",
                 timeout=10,
             )
             r.raise_for_status()
-            val = r.json().get("result")
-            if val is not None:
-                rates[code] = float(val)
+            res = r.json().get("result")
+            if res is not None:
+                rates[code] = float(res)
+                continue
         except Exception:
-            # leave it out; we'll warn later if missing
             pass
     return rates
+
 
 
 def fetch_btc_chf() -> Optional[float]:
