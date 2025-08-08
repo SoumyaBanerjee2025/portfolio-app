@@ -535,11 +535,25 @@ def projection_page(role: str):
         st.subheader("Chart")
         long = df.melt(id_vars=["dt"], value_vars=["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"],
                        var_name="bucket", value_name="value")
-        fig = px.area(long, x="dt", y="value", color="bucket", title="Projection by bucket", color_discrete_sequence=BRIGHT)
-        # optional: "Today" line and annotation
-        fig.add_vline(x=pd.to_datetime(today), line_dash="dash", line_color="white",
-                      annotation_text=f"Today: {live_total:,.0f} CHF", annotation_position="top left")
-        st.plotly_chart(fig, use_container_width=True)
+        fig = px.area(long, x="dt", y="value", color="bucket",
+              title="Projection by bucket", color_discrete_sequence=BRIGHT)
+
+# ensure datetime for plotting (optional but robust)
+long["dt"] = pd.to_datetime(long["dt"])
+x_today = pd.to_datetime(today)
+
+# draw the line
+fig.add_vline(x=x_today, line_dash="dash", line_color="white")
+
+# add a separate annotation anchored to the top of the plot
+fig.add_annotation(
+    x=x_today, yref="paper", y=1.02,
+    text=f"Today: {live_total:,.0f} CHF",
+    showarrow=False, xanchor="left", align="left"
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
 
         st.subheader("Grand Total over time")
         fig2 = px.line(df, x="dt", y="grand_total", title="Grand Total (CHF)", color_discrete_sequence=BRIGHT)
