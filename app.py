@@ -1,7 +1,6 @@
-# app.py — Streamlit Portfolio / Projection Dashboard (MVP, patched)
+# app.py — Streamlit Portfolio / Projection Dashboard (MVP, FX-fixed, robust saves)
 
 import time
-import json
 import datetime as dt
 from typing import Dict, List, Optional
 
@@ -38,7 +37,7 @@ def make_client():
         key = st.secrets["supabase"]["service_role_key"]
         return create_client(url, key)
     except KeyError:
-        st.stop()  # Secrets not set yet; Streamlit Cloud will show the error earlier
+        st.stop()  # Secrets not set (Cloud shows a nicer message earlier)
 
 
 sb = make_client()
@@ -78,12 +77,10 @@ def login_panel() -> str:
 def get_accounts_df() -> pd.DataFrame:
     res = sb.table("accounts").select("*").order("created_at").execute()
     rows = res.data or []
+    cols = ["id","created_at","type","institution","currency","value_lc","class_tag","is_liquid","notes"]
     if not rows:
-        cols = ["id","created_at","type","institution","currency","value_lc","class_tag","is_liquid","notes"]
         return pd.DataFrame(columns=cols)
     df = pd.DataFrame(rows)
-    # Ensure column order
-    cols = ["id","created_at","type","institution","currency","value_lc","class_tag","is_liquid","notes"]
     for c in cols:
         if c not in df.columns:
             df[c] = None
@@ -146,18 +143,8 @@ def upsert_accounts(df: pd.DataFrame):
             sb.table("accounts").insert(payload).execute()
 
 
-
 def delete_account(row_id: str):
     sb.table("accounts").delete().eq("id", row_id).execute()
-
-
-def get_settings() -> Dict:
-    res = sb.table("settings").select("*").execute()
-    return {r["key"]: r["value"] for r in (res.data or [])}
-
-
-def update_settings(key: str, value: Dict):
-    sb.table("settings").upsert({"key": key, "value": value}, on_conflict="key").execute()
 
 
 def get_fx_table() -> pd.DataFrame:
@@ -179,8 +166,8 @@ def upsert_fx_row(code: str, rate: float, source: str, override: Optional[float]
 def get_projection_df() -> pd.DataFrame:
     res = sb.table("projection_rows").select("*").order("dt").execute()
     rows = res.data or []
+    cols = ["dt","cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e","grand_total"]
     if not rows:
-        cols = ["dt","cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e","grand_total"]
         return pd.DataFrame(columns=cols)
     df = pd.DataFrame(rows)
     df["dt"] = pd.to_datetime(df["dt"]).dt.date
@@ -218,31 +205,26 @@ def upsert_projection_df(df: pd.DataFrame):
 # -----------------------
 def fetch_live_fx(target_codes: List[str]) -> Dict[str, float]:
     """
-    Return conversion rate for 1 unit of <code> -> CHF.
-
-    exchangerate.host with base=CHF returns: 1 CHF -> X <code>.
-    To convert <code> -> CHF we need the inverse: 1 / X.
+    Return conversion rate for 1 unit of <code> -> CHF, using exchangerate.host/convert.
+    Example: convert?from=GBP&to=CHF returns 1 GBP in CHF.
     """
-    target_codes = [c.upper() for c in target_codes]
     rates = {"CHF": 1.0}
-
-    fx_url = st.secrets["api"].get("fx_url", "https://api.exchangerate.host/latest?base=CHF")
-    try:
-        resp = requests.get(fx_url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("rates", {})
-        for code in target_codes:
-            if code == "CHF":
-                rates[code] = 1.0
-            elif code in raw and raw[code]:
-                chf_to_code = float(raw[code])  # 1 CHF -> X code
-                if chf_to_code > 0:
-                    rates[code] = 1.0 / chf_to_code  # 1 code -> CHF
-        return rates
-    except Exception:
-        return rates
-
+    for code in {c.upper() for c in target_codes}:
+        if code in ("CHF", "BTC"):
+            continue
+        try:
+            r = requests.get(
+                f"https://api.exchangerate.host/convert?from={code}&to=CHF",
+                timeout=10,
+            )
+            r.raise_for_status()
+            val = r.json().get("result")
+            if val is not None:
+                rates[code] = float(val)
+        except Exception:
+            # leave it out; we'll warn later if missing
+            pass
+    return rates
 
 
 def fetch_btc_chf() -> Optional[float]:
@@ -263,18 +245,18 @@ def compute_live_view(accts: pd.DataFrame, fx_tbl: pd.DataFrame, use_live: bool,
     df = accts.copy()
     df["currency"] = df["currency"].astype(str).str.upper()
 
-    # start with whatever is cached in DB
+    # start with whatever is cached
     rate_map = {row["code"].upper(): float(row["override_rate"] or row["rate_to_chf"]) for _, row in fx_tbl.iterrows()}
 
-    # ALWAYS refresh live FX for every code seen (except CHF/BTC) so we don't get stuck with stale '1.0'
+    # ALWAYS refresh live FX for all codes we see (except CHF/BTC)
     codes = sorted(set(df["currency"]) - {"CHF", "BTC"})
     if use_live and codes:
-        live = fetch_live_fx(codes)  # returns 1 <code> -> CHF
+        live = fetch_live_fx(codes)  # returns <code> -> CHF
         for k, v in live.items():
             rate_map[k] = v
-            upsert_fx_row(k, v, source="live")  # cache latest
+            upsert_fx_row(k, v, source="live")
 
-    # BTC
+    # BTC handling (price in CHF)
     if use_live:
         live_btc = fetch_btc_chf()
         if live_btc:
@@ -284,13 +266,18 @@ def compute_live_view(accts: pd.DataFrame, fx_tbl: pd.DataFrame, use_live: bool,
         rate_map["BTC"] = float(btc_override)
         upsert_fx_row("BTC", rate_map["BTC"], source="override", override=rate_map["BTC"])
 
+    # map rates and warn if any missing
+    df["rate_to_chf"] = df["currency"].map(rate_map)
+    missing_codes = sorted(set(df.loc[df["rate_to_chf"].isna(), "currency"]))
+    if missing_codes:
+        st.warning(f"Missing FX rates for: {', '.join(missing_codes)}. Using 1.0 temporarily.")
+    df["rate_to_chf"] = df["rate_to_chf"].fillna(1.0)
+
     # final conversion
-    df["rate_to_chf"] = df["currency"].map(rate_map).fillna(1.0)
     df["value_chf"] = (pd.to_numeric(df["value_lc"], errors="coerce").fillna(0.0) * df["rate_to_chf"]).astype(float)
     total = df["value_chf"].sum() or 1.0
     df["pct"] = df["value_chf"] / total
     return df
-
 
 # -----------------------
 # Pages
@@ -329,7 +316,7 @@ def live_page(role: str):
             key="accts_editor",
         )
 
-        col_s, col_d = st.columns([1, 1])
+        col_s, col_d, col_util = st.columns([1, 1, 1])
 
         with col_s:
             if st.button("Save accounts"):
@@ -354,6 +341,14 @@ def live_page(role: str):
                     time.sleep(0.5)
                     st.experimental_rerun()
 
+        with col_util:
+            st.markdown("**Utilities**")
+            if st.button("Refresh FX cache (force refetch)"):
+                sb.table("fx_rates").delete().neq("code", None).execute()
+                st.success("FX cache cleared — toggling live FX will refetch.")
+                time.sleep(0.6)
+                st.experimental_rerun()
+
         st.divider()
         st.subheader("Import accounts from Excel (Live tab)")
         up = st.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"], accept_multiple_files=False, key="live_up")
@@ -365,7 +360,7 @@ def live_page(role: str):
                 else:
                     df_live = xl.parse("Live", header=None)
                     rows = []
-                    # Heuristic: try to pull rows that look like [Type, Institution, Value(LC)...]
+                    # Heuristic: pull rows that look like [Type, Institution, Value(LC)...]
                     for _, row in df_live.iterrows():
                         t = str(row[0]).strip() if pd.notnull(row[0]) else ""
                         inst = str(row[1]).strip() if pd.notnull(row[1]) else ""
@@ -413,10 +408,9 @@ def live_page(role: str):
     st.subheader("Totals")
     total = live_df["value_chf"].sum()
     liquid = live_df[live_df["is_liquid"]]["value_chf"].sum()
-    c1, c2, c3 = st.columns(3)
+    c1, c2, _ = st.columns(3)
     c1.metric("Grand Total (CHF)", f"{total:,.2f}")
     c2.metric("Liquid Assets (CHF)", f"{liquid:,.2f}")
-    c3.metric("# Accounts", f"{len(live_df):,}")
 
     st.subheader("Detail table")
     show = live_df[["type","institution","currency","value_lc","rate_to_chf","value_chf","class_tag","is_liquid"]].copy()
