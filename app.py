@@ -91,36 +91,35 @@ def get_accounts_df() -> pd.DataFrame:
 
 
 def upsert_accounts(df: pd.DataFrame):
-    """Sanitize rows, skip empty editor rows, then upsert."""
-    import numpy as np
+    """Sanitize rows, skip blanks, INSERT new rows, UPDATE existing rows."""
     if df is None or df.empty:
         return
-    df = df.copy()
 
+    df = df.copy()
     required = ["type", "institution", "currency", "value_lc", "class_tag"]
     for col in required + ["id", "is_liquid", "notes"]:
         if col not in df.columns:
             df[col] = None
 
-    # Drop rows that are all-empty in required fields
+    # Drop completely empty editor rows
     df = df[~df[required].isnull().all(axis=1)]
 
     for _, r in df.iterrows():
-        # Skip still-empty rows
+        # Skip rows still missing core fields
         if all(pd.isna(r.get(k)) or str(r.get(k)).strip() == "" for k in required):
             continue
 
         # Clean values
-        ctag = (str(r.get("class_tag", "")).strip()
-                .replace("Cash+Bond", "Cash+Bonds")
-                .replace("Cash + Bonds", "Cash+Bonds"))
-        if ctag not in ("Global Equity", "Swiss Equity", "Cash+Bonds"):
-            ctag = "Cash+Bonds"
+        class_tag = (str(r.get("class_tag", "")).strip()
+                     .replace("Cash+Bond", "Cash+Bonds")
+                     .replace("Cash + Bonds", "Cash+Bonds"))
+        if class_tag not in ("Global Equity", "Swiss Equity", "Cash+Bonds"):
+            class_tag = "Cash+Bonds"
 
         try:
-            val = float(r.get("value_lc")) if pd.notnull(r.get("value_lc")) else 0.0
+            value_lc = float(r.get("value_lc")) if pd.notnull(r.get("value_lc")) else 0.0
         except Exception:
-            val = 0.0
+            value_lc = 0.0
 
         notes = r.get("notes")
         if notes is None or (isinstance(notes, float) and pd.isna(notes)):
@@ -129,17 +128,23 @@ def upsert_accounts(df: pd.DataFrame):
             notes = str(notes)
 
         payload = {
-            "id": r.get("id") or None,
             "type": str(r.get("type", "")).strip() or "Cash",
             "institution": str(r.get("institution", "")).strip() or "Unknown",
             "currency": str(r.get("currency", "CHF")).strip().upper() or "CHF",
-            "value_lc": val,
-            "class_tag": ctag,
+            "value_lc": value_lc,
+            "class_tag": class_tag,
             "is_liquid": bool(r.get("is_liquid")) if pd.notnull(r.get("is_liquid")) else False,
             "notes": notes,
         }
-        # One upsert call covers insert/update; let DB assign id if None
-        sb.table("accounts").upsert(payload, on_conflict="id").execute()
+
+        row_id = r.get("id")
+        if row_id and str(row_id).strip():
+            # UPDATE existing row
+            sb.table("accounts").update(payload).eq("id", str(row_id)).execute()
+        else:
+            # INSERT new row (let DB auto-generate id)
+            sb.table("accounts").insert(payload).execute()
+
 
 
 def delete_account(row_id: str):
