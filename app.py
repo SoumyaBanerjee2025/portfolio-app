@@ -259,36 +259,38 @@ def fetch_btc_chf() -> Optional[float]:
 def compute_live_view(accts: pd.DataFrame, fx_tbl: pd.DataFrame, use_live: bool, btc_override: Optional[float]) -> pd.DataFrame:
     if accts is None or accts.empty:
         return pd.DataFrame()
+
     df = accts.copy()
     df["currency"] = df["currency"].astype(str).str.upper()
 
-    # Start from DB rates (override if present)
+    # start with whatever is cached in DB
     rate_map = {row["code"].upper(): float(row["override_rate"] or row["rate_to_chf"]) for _, row in fx_tbl.iterrows()}
 
-    # Fetch live FX for missing codes
-    missing = sorted(set(df["currency"]) - set(rate_map.keys()) - {"BTC"})
-    if use_live and missing:
-        live = fetch_live_fx(missing)
+    # ALWAYS refresh live FX for every code seen (except CHF/BTC) so we don't get stuck with stale '1.0'
+    codes = sorted(set(df["currency"]) - {"CHF", "BTC"})
+    if use_live and codes:
+        live = fetch_live_fx(codes)  # returns 1 <code> -> CHF
         for k, v in live.items():
-            if k not in rate_map:
-                rate_map[k] = v
-                upsert_fx_row(k, v, source="live")
+            rate_map[k] = v
+            upsert_fx_row(k, v, source="live")  # cache latest
 
     # BTC
     if use_live:
         live_btc = fetch_btc_chf()
         if live_btc:
+            rate_map["BTC"] = live_btc
             upsert_fx_row("BTC", live_btc, source="coingecko")
-            rate_map.setdefault("BTC", live_btc)
     if btc_override is not None and btc_override > 0:
         rate_map["BTC"] = float(btc_override)
         upsert_fx_row("BTC", rate_map["BTC"], source="override", override=rate_map["BTC"])
 
+    # final conversion
     df["rate_to_chf"] = df["currency"].map(rate_map).fillna(1.0)
     df["value_chf"] = (pd.to_numeric(df["value_lc"], errors="coerce").fillna(0.0) * df["rate_to_chf"]).astype(float)
     total = df["value_chf"].sum() or 1.0
     df["pct"] = df["value_chf"] / total
     return df
+
 
 # -----------------------
 # Pages
