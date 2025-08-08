@@ -178,14 +178,25 @@ def upsert_projection_df(df: pd.DataFrame):
     if df is None or df.empty:
         return
     df = df.copy()
-    # Normalize columns
-    for c in ["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]:
+
+    # Clean/validate dates
+    df["dt"] = pd.to_datetime(df["dt"], errors="coerce").dt.date
+    df = df[df["dt"].notnull()]
+
+    # Clean numeric columns (strip commas/spaces, coerce to numbers)
+    num_cols = ["cash", "bitcoin", "pillar3a", "pillar2", "ibkr", "pillar1e", "grand_total"]
+    for c in num_cols:
         if c in df.columns:
+            df[c] = (
+                df[c]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace(" ", "", regex=False)
+            )
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        else:
-            df[c] = 0.0
-    if "grand_total" not in df.columns:
-        df["grand_total"] = df[["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]].sum(axis=1)
+
+    # Always recompute grand_total server-side
+    df["grand_total"] = df[["cash", "bitcoin", "pillar3a", "pillar2", "ibkr", "pillar1e"]].sum(axis=1)
 
     for _, r in df.iterrows():
         payload = {
@@ -199,6 +210,7 @@ def upsert_projection_df(df: pd.DataFrame):
             "grand_total": float(r.get("grand_total") or 0),
         }
         sb.table("projection_rows").upsert(payload, on_conflict="dt").execute()
+
 
 # -----------------------
 # Live page helpers
