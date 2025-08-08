@@ -1,9 +1,10 @@
 # app.py — Streamlit Portfolio / Projection Dashboard
-# - Robust account editing & saving (with cleanup)
-# - Live FX (Frankfurter -> exchangerate.host fallback) + BTC
-# - FX override + "Refresh FX cache" utility
+# - Account editor + save (robust cleanup)
+# - Live FX (Frankfurter -> exchangerate.host fallback) + BTC override
+# - FX cache refresh utility
 # - Excel importers (Live / Projection) with cleaning
 # - Projections charts + Actuals snapshot (step/flat line) overlay
+# - Safe "Today" line/annotation (no Plotly crash)
 
 import time
 import datetime as dt
@@ -533,32 +534,30 @@ def projection_page(role: str):
     df = get_projection_df()
     if not df.empty:
         st.subheader("Chart")
+
+        # Stacked area by bucket
         long = df.melt(id_vars=["dt"], value_vars=["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"],
                        var_name="bucket", value_name="value")
+        long["dt"] = pd.to_datetime(long["dt"])
+        x_today = pd.to_datetime(today)
+
         fig = px.area(long, x="dt", y="value", color="bucket",
-              title="Projection by bucket", color_discrete_sequence=BRIGHT)
+                      title="Projection by bucket", color_discrete_sequence=BRIGHT)
 
-# ensure datetime for plotting (optional but robust)
-long["dt"] = pd.to_datetime(long["dt"])
-x_today = pd.to_datetime(today)
+        # Safe vline + separate annotation (avoids Plotly crash)
+        fig.add_vline(x=x_today, line_dash="dash", line_color="white")
+        fig.add_annotation(
+            x=x_today, yref="paper", y=1.02,
+            text=f"Today: {live_total:,.0f} CHF",
+            showarrow=False, xanchor="left", align="left"
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-# draw the line
-fig.add_vline(x=x_today, line_dash="dash", line_color="white")
-
-# add a separate annotation anchored to the top of the plot
-fig.add_annotation(
-    x=x_today, yref="paper", y=1.02,
-    text=f"Today: {live_total:,.0f} CHF",
-    showarrow=False, xanchor="left", align="left"
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-
+        # Grand total over time
         st.subheader("Grand Total over time")
         fig2 = px.line(df, x="dt", y="grand_total", title="Grand Total (CHF)", color_discrete_sequence=BRIGHT)
 
-        # Overlay ACTUAL history (step/flat line) + snapshot markers
+        # Actual history as a step/flat line + markers
         if not actual_df.empty:
             s = (actual_df.set_index(pd.to_datetime(actual_df["dt"])).sort_index()["grand_total"])
             daily = s.asfreq("D").ffill()
