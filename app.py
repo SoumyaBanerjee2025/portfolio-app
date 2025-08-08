@@ -170,22 +170,60 @@ def get_accounts_df() -> pd.DataFrame:
     return df[cols]
 
 def upsert_accounts(df: pd.DataFrame):
-    # Upsert each row by id (if id empty, let DB create id via insert)
+    import numpy as np
+
+    # Drop rows that are completely empty or placeholders from the editor
+    required = ["type", "institution", "currency", "value_lc", "class_tag"]
+    if df is None or df.empty:
+        return
+    df = df.copy()
+
+    # Normalize column names if needed
+    for col in required + ["id", "is_liquid", "notes"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Remove rows where all required fields are blank/NaN
+    df = df[~df[required].isnull().all(axis=1)]
+
     for _, r in df.iterrows():
+        # Skip rows still missing core fields
+        if all(pd.isna(r.get(k)) or str(r.get(k)).strip() == "" for k in required):
+            continue
+
+        # Clean/normalize values
+        ctag = (str(r.get("class_tag", "")).strip()
+                .replace("Cash+Bond", "Cash+Bonds")
+                .replace("Cash + Bonds", "Cash+Bonds"))
+        if ctag not in ("Global Equity", "Swiss Equity", "Cash+Bonds"):
+            ctag = "Cash+Bonds"
+
+        val = r.get("value_lc")
+        try:
+            val = float(val) if pd.notnull(val) else 0.0
+        except Exception:
+            val = 0.0
+
+        notes = r.get("notes")
+        if notes is None or (isinstance(notes, float) and pd.isna(notes)):
+            notes = None
+        else:
+            notes = str(notes)
+
         payload = {
             "id": r.get("id") or None,
-            "type": r["type"],
-            "institution": r["institution"],
-            "currency": r["currency"],
-            "value_lc": float(r["value_lc"]) if pd.notnull(r["value_lc"]) else 0.0,
-            "class_tag": r["class_tag"],
-            "is_liquid": bool(r["is_liquid"]) if pd.notnull(r["is_liquid"]) else False,
-            "notes": r.get("notes"),
+            "type": str(r.get("type", "")).strip() or "Cash",
+            "institution": str(r.get("institution", "")).strip() or "Unknown",
+            "currency": str(r.get("currency", "CHF")).strip().upper() or "CHF",
+            "value_lc": val,
+            "class_tag": ctag,
+            "is_liquid": bool(r.get("is_liquid")) if pd.notnull(r.get("is_liquid")) else False,
+            "notes": notes,
         }
-        if payload["id"] is None:
-            sb.table("accounts").insert(payload).execute()
-        else:
-            sb.table("accounts").upsert(payload, on_conflict="id").execute()
+
+        # Always use upsert; let Postgres generate id if None
+        sb.table("accounts").upsert(payload, on_conflict="id").execute()
+
 
 
 def delete_account(row_id: str):
@@ -368,12 +406,17 @@ def live_page(role: str):
             key="accts_editor",
         )
         col_s, col_d = st.columns([1,1])
-        with col_s:
-            if st.button("Save accounts"):
-                upsert_accounts(edited.drop(columns=[c for c in ["created_at"] if c in edited.columns]))
-                st.success("Saved.")
-                time.sleep(0.6)
-                st.experimental_rerun()
+       with col_s:
+    if st.button("Save accounts"):
+        clean = edited.drop(columns=[c for c in ["created_at"] if c in edited.columns])
+        # Drop any all-empty editor rows (Streamlit often adds a blank last row)
+        req = ["type", "institution", "currency", "value_lc", "class_tag"]
+        clean = clean[~clean[req].isnull().all(axis=1)]
+        upsert_accounts(clean)
+        st.success("Saved.")
+        time.sleep(0.6)
+        st.experimental_rerun()
+
         with col_d:
             if not accts.empty:
                 to_delete = st.selectbox("Delete row by id (careful)", options=["-"] + accts["id"].astype(str).tolist())
