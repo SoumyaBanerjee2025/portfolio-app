@@ -1,138 +1,55 @@
-"""
-Streamlit Portfolio / Projection Dashboard (MVP)
+# app.py — Streamlit Portfolio / Projection Dashboard (MVP, patched)
 
-What this app does
-- Replaces your two Google Sheet tabs: "Live" (current portfolio) and "Projection" (hard-coded schedule).
-- Admin (you) can edit inputs (formerly the blue cells), FX overrides, account tags, and projection table.
-- Viewer (your wife) can see everything but cannot edit.
-- Data is persisted in Supabase (managed Postgres). Auth is via simple app-level password (admin vs viewer).
-
-How to run locally (5‑minute guide)
-1) `pip install -r requirements.txt`
-2) Create a file `.streamlit/secrets.toml` (see the SECRETS section below) and paste your values.
-3) `streamlit run app.py`
-
-How to deploy online (Streamlit Cloud, 10‑minute guide)
-1) Create a free Supabase project at https://supabase.com > New project.
-   - In your project, open SQL Editor and run the DDL from the comment block named "SUPABASE SCHEMA" below.
-   - In Settings > API, copy your Project URL and Service Role key.
-2) Create a new public GitHub repo. Add 2 files: `app.py` (this file) and `requirements.txt` (see bottom of file).
-3) Go to https://share.streamlit.io (or Streamlit Cloud). Deploy your GitHub repo.
-4) In your deployed app > Settings > Secrets, paste the same content you would put into `.streamlit/secrets.toml` (see SECRETS below).
-5) Open the app. Log in with Admin password. Upload your Excel (the one you shared) on the Projection page to import the schedule once, and on the Live page to import account rows if you prefer.
-6) Share the link + Viewer password with your wife.
-
-SUPABASE SCHEMA — paste this in Supabase SQL Editor and RUN once
------------------------------------------------------------------
--- Enable pgcrypto for UUIDs, if not already enabled
-create extension if not exists pgcrypto;
-
-create table if not exists accounts (
-  id uuid primary key default gen_random_uuid(),
-  created_at timestamp with time zone default now(),
-  type text not null,                  -- e.g., Cash, Equity, Bitcoin
-  institution text not null,           -- e.g., HSBC, IBKR, Kraken
-  currency text not null,              -- e.g., CHF, USD, GBP, BTC
-  value_lc numeric not null,           -- Value in local currency (your input)
-  class_tag text not null check (class_tag in ('Global Equity','Swiss Equity','Cash+Bonds')),
-  is_liquid boolean not null default false,
-  notes text
-);
-
-create table if not exists settings (
-  key text primary key,
-  value jsonb
-);
-
-create table if not exists fx_rates (
-  code text primary key,               -- currency code e.g. USD, EUR, BTC
-  rate_to_chf numeric not null,        -- base live rate to CHF
-  override_rate numeric,               -- optional admin override
-  source text,
-  updated_at timestamp with time zone default now()
-);
-
-create table if not exists projection_rows (
-  dt date primary key,
-  cash numeric,
-  bitcoin numeric,
-  pillar3a numeric,
-  pillar2 numeric,
-  ibkr numeric,
-  pillar1e numeric,
-  grand_total numeric
-);
-
--- Seed default settings
-insert into settings(key, value) values
-  ('assumptions', '{"cash":0.0, "bitcoin":0.08, "pillar3a":0.065, "pillar2":0.0075, "ibkr":0.07, "pillar1e":0.04}')
-  on conflict (key) do nothing;
-
------------------------------------------------------------------
-
-SECRETS — put this in `.streamlit/secrets.toml` (local) or Streamlit Cloud > Secrets
-----------------------------------------------------------------------------------
-[supabase]
-url = "https://YOUR-PROJECT.supabase.co"
-service_role_key = "YOUR_SERVICE_ROLE_KEY"   # keep secret! only on server, never in client-side code
-
-[auth]
-admin_password = "SET_A_STRONG_ADMIN_PASSWORD"
-viewer_password = "SET_A_VIEWER_PASSWORD_FOR_WIFE"
-
-[api]
-fx_base = "CHF"
-fx_url = "https://api.exchangerate.host/latest?base=CHF"   # can change base via secrets if needed
-btc_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=chf"
-
-[ui]
-brand = "Soumya Portfolio"
-
-"""
-
-import io
-import json
 import time
+import json
 import datetime as dt
 from typing import Dict, List, Optional
 
 import pandas as pd
-import plotly.express as px
 import requests
 import streamlit as st
-from streamlit.runtime.state import SessionState
+import plotly.express as px
 
-# Supabase client
+# --- Supabase client ---
 try:
-    from supabase import create_client, Client
+    from supabase import create_client
 except Exception:
     create_client = None
-    Client = None
 
 # -----------------------
-# Helpers & Configuration
+# Config
 # -----------------------
 APP_BRAND = st.secrets.get("ui", {}).get("brand", "Portfolio App")
+ROLE_ADMIN = "admin"
+ROLE_VIEWER = "viewer"
 
-def make_client() -> Optional['Client']:
+CLASS_CHOICES = ["Global Equity", "Swiss Equity", "Cash+Bonds"]
+BRIGHT = px.colors.qualitative.Bold + px.colors.qualitative.Set3 + px.colors.qualitative.Vivid
+
+# -----------------------
+# Supabase connection
+# -----------------------
+def make_client():
     if create_client is None:
-        st.error("supabase-py not installed. Add it to requirements.txt")
+        st.error("supabase-py not installed. Ensure `requirements.txt` includes `supabase`.")
         return None
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["service_role_key"]
-    return create_client(url, key)
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["service_role_key"]
+        return create_client(url, key)
+    except KeyError:
+        st.stop()  # Secrets not set yet; Streamlit Cloud will show the error earlier
+
 
 sb = make_client()
 
 # -----------------------
-# Auth (simple roles)
+# Auth (simple passwords)
 # -----------------------
-ROLE_ADMIN = "admin"
-ROLE_VIEWER = "viewer"
-
-def login_panel():
+def login_panel() -> str:
     st.sidebar.markdown(f"### {APP_BRAND}")
     role = st.session_state.get("role")
+
     if role in (ROLE_ADMIN, ROLE_VIEWER):
         with st.sidebar.expander("Session"):
             st.write(f"Logged in as **{role}**")
@@ -158,49 +75,50 @@ def login_panel():
 # -----------------------
 # Data access layer
 # -----------------------
-
 def get_accounts_df() -> pd.DataFrame:
-    res = sb.table("accounts").select("*").execute()
+    res = sb.table("accounts").select("*").order("created_at").execute()
     rows = res.data or []
     if not rows:
-        return pd.DataFrame(columns=["id","created_at","type","institution","currency","value_lc","class_tag","is_liquid","notes"])  # empty
+        cols = ["id","created_at","type","institution","currency","value_lc","class_tag","is_liquid","notes"]
+        return pd.DataFrame(columns=cols)
     df = pd.DataFrame(rows)
     # Ensure column order
     cols = ["id","created_at","type","institution","currency","value_lc","class_tag","is_liquid","notes"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
     return df[cols]
 
-def upsert_accounts(df: pd.DataFrame):
-    import numpy as np
 
-    # Drop rows that are completely empty or placeholders from the editor
-    required = ["type", "institution", "currency", "value_lc", "class_tag"]
+def upsert_accounts(df: pd.DataFrame):
+    """Sanitize rows, skip empty editor rows, then upsert."""
+    import numpy as np
     if df is None or df.empty:
         return
     df = df.copy()
 
-    # Normalize column names if needed
+    required = ["type", "institution", "currency", "value_lc", "class_tag"]
     for col in required + ["id", "is_liquid", "notes"]:
         if col not in df.columns:
             df[col] = None
 
-    # Remove rows where all required fields are blank/NaN
+    # Drop rows that are all-empty in required fields
     df = df[~df[required].isnull().all(axis=1)]
 
     for _, r in df.iterrows():
-        # Skip rows still missing core fields
+        # Skip still-empty rows
         if all(pd.isna(r.get(k)) or str(r.get(k)).strip() == "" for k in required):
             continue
 
-        # Clean/normalize values
+        # Clean values
         ctag = (str(r.get("class_tag", "")).strip()
                 .replace("Cash+Bond", "Cash+Bonds")
                 .replace("Cash + Bonds", "Cash+Bonds"))
         if ctag not in ("Global Equity", "Swiss Equity", "Cash+Bonds"):
             ctag = "Cash+Bonds"
 
-        val = r.get("value_lc")
         try:
-            val = float(val) if pd.notnull(val) else 0.0
+            val = float(r.get("value_lc")) if pd.notnull(r.get("value_lc")) else 0.0
         except Exception:
             val = 0.0
 
@@ -220,10 +138,8 @@ def upsert_accounts(df: pd.DataFrame):
             "is_liquid": bool(r.get("is_liquid")) if pd.notnull(r.get("is_liquid")) else False,
             "notes": notes,
         }
-
-        # Always use upsert; let Postgres generate id if None
+        # One upsert call covers insert/update; let DB assign id if None
         sb.table("accounts").upsert(payload, on_conflict="id").execute()
-
 
 
 def delete_account(row_id: str):
@@ -232,13 +148,11 @@ def delete_account(row_id: str):
 
 def get_settings() -> Dict:
     res = sb.table("settings").select("*").execute()
-    d = {r["key"]: r["value"] for r in (res.data or [])}
-    return d
+    return {r["key"]: r["value"] for r in (res.data or [])}
 
 
 def update_settings(key: str, value: Dict):
-    payload = {"key": key, "value": value}
-    sb.table("settings").upsert(payload, on_conflict="key").execute()
+    sb.table("settings").upsert({"key": key, "value": value}, on_conflict="key").execute()
 
 
 def get_fx_table() -> pd.DataFrame:
@@ -248,7 +162,7 @@ def get_fx_table() -> pd.DataFrame:
 
 def upsert_fx_row(code: str, rate: float, source: str, override: Optional[float] = None):
     payload = {
-        "code": code,
+        "code": code.upper(),
         "rate_to_chf": float(rate),
         "override_rate": float(override) if override is not None else None,
         "source": source,
@@ -269,16 +183,21 @@ def get_projection_df() -> pd.DataFrame:
 
 
 def upsert_projection_df(df: pd.DataFrame):
-    # Compute grand_total if not provided
-    if "grand_total" in df.columns:
-        pass
-    else:
+    if df is None or df.empty:
+        return
+    df = df.copy()
+    # Normalize columns
+    for c in ["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        else:
+            df[c] = 0.0
+    if "grand_total" not in df.columns:
         df["grand_total"] = df[["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]].sum(axis=1)
 
-    # Upsert rows one by one (simple & safe)
     for _, r in df.iterrows():
         payload = {
-            "dt": str(r["dt"]),
+            "dt": str(pd.to_datetime(r["dt"]).date()),
             "cash": float(r.get("cash") or 0),
             "bitcoin": float(r.get("bitcoin") or 0),
             "pillar3a": float(r.get("pillar3a") or 0),
@@ -290,55 +209,50 @@ def upsert_projection_df(df: pd.DataFrame):
         sb.table("projection_rows").upsert(payload, on_conflict="dt").execute()
 
 # -----------------------
-# Live page logic
+# Live page helpers
 # -----------------------
-CLASS_CHOICES = ["Global Equity", "Swiss Equity", "Cash+Bonds"]
-
-BRIGHT = px.colors.qualitative.Bold + px.colors.qualitative.Set3 + px.colors.qualitative.Vivid
-
-
 def fetch_live_fx(target_codes: List[str]) -> Dict[str, float]:
-    """Fetch live FX to CHF for given codes. BTC handled separately."""
-    base = st.secrets["api"].get("fx_base", "CHF").upper()
-    fx_url = st.secrets["api"]["fx_url"]
-    rates = {base: 1.0}
+    """Return currency->CHF rate for each target code. Base CHF assumed."""
+    rates = {"CHF": 1.0}
+    fx_url = st.secrets["api"].get("fx_url", "https://api.exchangerate.host/latest?base=CHF")
     try:
         resp = requests.get(fx_url, timeout=10)
+        resp.raise_for_status()
         data = resp.json()
-        # exchangerate.host returns rates for many currencies vs base
         raw = data.get("rates", {})
         for code in target_codes:
             code = code.upper()
-            if code == base:
+            if code == "CHF":
                 rates[code] = 1.0
             elif code in raw:
-                # We need code->CHF. If base=CHF, rate is direct. If base != CHF, we'd need to invert; keep base=CHF by default.
-                rates[code] = 1.0 / raw[code] if base != "CHF" else raw[code]
+                rates[code] = float(raw[code])  # CHF base → direct code->CHF
         return rates
-    except Exception as e:
-        st.warning(f"FX fetch failed: {e}")
+    except Exception:
         return rates
 
 
 def fetch_btc_chf() -> Optional[float]:
     try:
-        resp = requests.get(st.secrets["api"]["btc_url"], timeout=10)
+        url = st.secrets["api"]["btc_url"]
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
         j = resp.json()
         return float(j.get("bitcoin", {}).get("chf"))
-    except Exception as e:
-        st.warning(f"BTC price fetch failed: {e}")
+    except Exception:
         return None
 
 
 def compute_live_view(accts: pd.DataFrame, fx_tbl: pd.DataFrame, use_live: bool, btc_override: Optional[float]) -> pd.DataFrame:
+    if accts is None or accts.empty:
+        return pd.DataFrame()
     df = accts.copy()
-    df["currency"] = df["currency"].str.upper()
+    df["currency"] = df["currency"].astype(str).str.upper()
 
-    # Build rate map: start with DB table
-    rate_map = {r["code"].upper(): float(r["override_rate"] or r["rate_to_chf"]) for _, r in fx_tbl.iterrows()}
+    # Start from DB rates (override if present)
+    rate_map = {row["code"].upper(): float(row["override_rate"] or row["rate_to_chf"]) for _, row in fx_tbl.iterrows()}
 
-    # Collect missing currencies and fetch live
-    missing = sorted(set(df["currency"]) - set(rate_map.keys()))
+    # Fetch live FX for missing codes
+    missing = sorted(set(df["currency"]) - set(rate_map.keys()) - {"BTC"})
     if use_live and missing:
         live = fetch_live_fx(missing)
         for k, v in live.items():
@@ -346,31 +260,25 @@ def compute_live_view(accts: pd.DataFrame, fx_tbl: pd.DataFrame, use_live: bool,
                 rate_map[k] = v
                 upsert_fx_row(k, v, source="live")
 
-    # BTC special-case
+    # BTC
     if use_live:
         live_btc = fetch_btc_chf()
         if live_btc:
             upsert_fx_row("BTC", live_btc, source="coingecko")
             rate_map.setdefault("BTC", live_btc)
-    if btc_override is not None:
-        rate_map["BTC"] = btc_override
-        upsert_fx_row("BTC", rate_map.get("BTC", 0), source="override", override=btc_override)
+    if btc_override is not None and btc_override > 0:
+        rate_map["BTC"] = float(btc_override)
+        upsert_fx_row("BTC", rate_map["BTC"], source="override", override=rate_map["BTC"])
 
-    # Default CHF if currency unknown
     df["rate_to_chf"] = df["currency"].map(rate_map).fillna(1.0)
-
-    # If currency is CHF, rate=1. If BTC, value_lc is in BTC units and we convert by price.
-    df["value_chf"] = df.apply(lambda r: float(r["value_lc"]) * float(r["rate_to_chf"]) , axis=1)
-
-    # Rollups
-    total = df["value_chf"].sum()
-    if total == 0:
-        total = 1
+    df["value_chf"] = (pd.to_numeric(df["value_lc"], errors="coerce").fillna(0.0) * df["rate_to_chf"]).astype(float)
+    total = df["value_chf"].sum() or 1.0
     df["pct"] = df["value_chf"] / total
-
     return df
 
-
+# -----------------------
+# Pages
+# -----------------------
 def live_page(role: str):
     st.title("Live Portfolio")
 
@@ -378,7 +286,6 @@ def live_page(role: str):
     btc_override = st.number_input("BTC → CHF override (optional)", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
     btc_override = btc_override if btc_override > 0 else None
 
-    # Accounts editor
     accts = get_accounts_df()
 
     if role == ROLE_ADMIN:
@@ -405,21 +312,26 @@ def live_page(role: str):
             use_container_width=True,
             key="accts_editor",
         )
-        col_s, col_d = st.columns([1,1])
-       with col_s:
-    if st.button("Save accounts"):
-        clean = edited.drop(columns=[c for c in ["created_at"] if c in edited.columns])
-        # Drop any all-empty editor rows (Streamlit often adds a blank last row)
-        req = ["type", "institution", "currency", "value_lc", "class_tag"]
-        clean = clean[~clean[req].isnull().all(axis=1)]
-        upsert_accounts(clean)
-        st.success("Saved.")
-        time.sleep(0.6)
-        st.experimental_rerun()
+
+        col_s, col_d = st.columns([1, 1])
+
+        with col_s:
+            if st.button("Save accounts"):
+                clean = edited.drop(columns=[c for c in ["created_at"] if c in edited.columns])
+                # Drop any all-empty editor rows (Streamlit often adds a blank trailing row)
+                req = ["type", "institution", "currency", "value_lc", "class_tag"]
+                clean = clean[~clean[req].isnull().all(axis=1)]
+                upsert_accounts(clean)
+                st.success("Saved.")
+                time.sleep(0.6)
+                st.experimental_rerun()
 
         with col_d:
             if not accts.empty:
-                to_delete = st.selectbox("Delete row by id (careful)", options=["-"] + accts["id"].astype(str).tolist())
+                to_delete = st.selectbox(
+                    "Delete row by id (careful)",
+                    options=["-"] + accts["id"].astype(str).tolist()
+                )
                 if to_delete != "-" and st.button("Confirm delete"):
                     delete_account(to_delete)
                     st.success("Deleted.")
@@ -428,7 +340,7 @@ def live_page(role: str):
 
         st.divider()
         st.subheader("Import accounts from Excel (Live tab)")
-        up = st.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"], accept_multiple_files=False)
+        up = st.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"], accept_multiple_files=False, key="live_up")
         if up:
             try:
                 xl = pd.ExcelFile(up)
@@ -436,27 +348,28 @@ def live_page(role: str):
                     st.error("Couldn't find a 'Live' sheet in this workbook.")
                 else:
                     df_live = xl.parse("Live", header=None)
-                    # Heuristic: look for rows that contain account structure like [Type, Name, Value(LC), Value(CHF)...]
-                    # We'll try to capture rows where column 1/2 look textual and column 3 numeric
                     rows = []
+                    # Heuristic: try to pull rows that look like [Type, Institution, Value(LC)...]
                     for _, row in df_live.iterrows():
-                        try:
-                            t, inst, v = str(row[0]).strip(), str(row[1]).strip(), row[2]
-                            if t.lower() in ["cash","equity","bitcoin","pension"] and pd.to_numeric(v, errors="coerce") is not None:
-                                rows.append({
-                                    "type": t.title(),
-                                    "institution": inst,
-                                    "currency": "CHF",  # default, you can change after import
-                                    "value_lc": float(v),
-                                    "class_tag": "Cash+Bonds" if t.lower()=="cash" else ("Global Equity" if t.lower() in ["equity","bitcoin"] else "Swiss Equity"),
-                                    "is_liquid": t.lower() in ["cash","equity","bitcoin"],
-                                })
-                        except Exception:
-                            pass
+                        t = str(row[0]).strip() if pd.notnull(row[0]) else ""
+                        inst = str(row[1]).strip() if pd.notnull(row[1]) else ""
+                        val = pd.to_numeric(row[2], errors="coerce")
+                        if t.lower() in ("cash","equity","bitcoin","pension") and pd.notnull(val):
+                            default_class = "Cash+Bonds" if t.lower()=="cash" else ("Global Equity" if t.lower() in ("equity","bitcoin") else "Swiss Equity")
+                            rows.append({
+                                "type": t.title(),
+                                "institution": inst or "Unknown",
+                                "currency": "CHF",  # adjust after import
+                                "value_lc": float(val),
+                                "class_tag": default_class,
+                                "is_liquid": t.lower() in ("cash","equity","bitcoin"),
+                                "notes": None
+                            })
                     if rows:
-                        st.dataframe(pd.DataFrame(rows))
+                        df_rows = pd.DataFrame(rows)
+                        st.dataframe(df_rows, use_container_width=True)
                         if st.button("Insert imported rows"):
-                            upsert_accounts(pd.DataFrame(rows))
+                            upsert_accounts(df_rows)
                             st.success("Imported.")
                             st.experimental_rerun()
                     else:
@@ -464,7 +377,7 @@ def live_page(role: str):
             except Exception as e:
                 st.error(f"Import failed: {e}")
 
-    # Rates table + calculation
+    # After any edits/imports, compute view
     fx_tbl = get_fx_table()
     live_df = compute_live_view(get_accounts_df(), fx_tbl, use_live=use_live, btc_override=btc_override)
 
@@ -473,7 +386,6 @@ def live_page(role: str):
         st.info("Add accounts to see charts.")
         return
 
-    # Charts
     by_inst = live_df.groupby("institution", as_index=False)["value_chf"].sum().sort_values("value_chf", ascending=False)
     fig_bar = px.bar(by_inst, x="institution", y="value_chf", title="By Institution", color_discrete_sequence=BRIGHT)
     st.plotly_chart(fig_bar, use_container_width=True)
@@ -495,16 +407,9 @@ def live_page(role: str):
     show = show.sort_values("value_chf", ascending=False)
     st.dataframe(show, use_container_width=True)
 
-    st.caption("Tip: Change class tags or Liquid? in the editor (admin) to adjust the rollups above.")
-
-
-# -----------------------
-# Projection page
-# -----------------------
 
 def projection_page(role: str):
     st.title("Projections (hard-coded schedule)")
-    st.write("This mirrors your left-side table. No partial year. You can import once from Excel or edit inline.")
 
     df = get_projection_df()
 
@@ -518,29 +423,26 @@ def projection_page(role: str):
                         st.error("Couldn't find a 'Projection' sheet.")
                     else:
                         raw = x.parse("Projection", header=None)
-                        # Expect headers in row 2, data from row 3 onward similar to your sheet.
-                        # We'll scan for a column that looks like dates, then the next 6 numeric columns, then compute total.
-                        # Heuristic is intentionally forgiving.
-                        candidates = []
-                        for r in range(0, min(10, len(raw))):
+                        # Find first row that looks like it starts data (heuristic)
+                        start_row = None
+                        for r in range(min(10, len(raw))):
                             row = raw.iloc[r].tolist()
                             if any(isinstance(v, (dt.date, dt.datetime, pd.Timestamp)) for v in row):
-                                candidates.append(r)
-                        start_row = candidates[0] if candidates else 2
-                        data = raw.iloc[start_row:]
-                        # Find first 7 non-null columns
-                        data = data.dropna(how='all', axis=1)
+                                start_row = r
+                                break
+                        if start_row is None:
+                            start_row = 2
+                        data = raw.iloc[start_row:].dropna(how="all", axis=1)
                         data.columns = range(data.shape[1])
-                        # Expect: [date, cash, bitcoin, pillar3a, pillar2, ibkr, pillar1e, (maybe total)]
                         cols_map = {0:"dt",1:"cash",2:"bitcoin",3:"pillar3a",4:"pillar2",5:"ibkr",6:"pillar1e"}
                         out = data[list(cols_map.keys())].rename(columns=cols_map)
                         out = out[out["dt"].notnull()]
                         out["dt"] = pd.to_datetime(out["dt"]).dt.date
-                        out[["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]] = out[["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+                        for c in ["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]:
+                            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
                         out["grand_total"] = out[["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"]].sum(axis=1)
-                        st.dataframe(out.head())
+                        st.dataframe(out.head(), use_container_width=True)
                         if st.button("Replace projection table with imported data"):
-                            # Clear and upsert (simple way: delete all first)
                             sb.table("projection_rows").delete().neq("dt", None).execute()
                             upsert_projection_df(out)
                             st.success("Projection imported.")
@@ -549,17 +451,16 @@ def projection_page(role: str):
                     st.error(f"Import failed: {e}")
 
     st.subheader("Schedule")
-    editable = df.copy()
     if role == ROLE_VIEWER:
-        st.dataframe(editable, use_container_width=True)
+        st.dataframe(df, use_container_width=True)
     else:
         edited = st.data_editor(
-            editable,
+            df if not df.empty else pd.DataFrame(columns=["dt","cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e","grand_total"]),
             num_rows="dynamic",
             hide_index=True,
             use_container_width=True,
             column_config={
-                "dt": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                "dt": st.column_config.DateColumn("Date", format="YYYY-MM-DD")
             },
             key="proj_editor",
         )
@@ -569,6 +470,7 @@ def projection_page(role: str):
             time.sleep(0.5)
             st.experimental_rerun()
 
+    df = get_projection_df()
     if not df.empty:
         st.subheader("Chart")
         long = df.melt(id_vars=["dt"], value_vars=["cash","bitcoin","pillar3a","pillar2","ibkr","pillar1e"], var_name="bucket", value_name="value")
@@ -587,19 +489,8 @@ def projection_page(role: str):
 # -----------------------
 role = login_panel()
 
-page = st.sidebar.radio("Navigate", ["Live","Projections"], index=0)
+page = st.sidebar.radio("Navigate", ["Live", "Projections"], index=0)
 if page == "Live":
     live_page(role)
 else:
     projection_page(role)
-
-"""
-requirements.txt (create this file next to app.py)
------------------------------------------------
-streamlit==1.36.0
-pandas
-plotly
-requests
-supabase
-openpyxl
-"""
